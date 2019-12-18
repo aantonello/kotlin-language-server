@@ -20,6 +20,10 @@ import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration as KotlinCompilerConfiguration
 import org.jetbrains.kotlin.config.JVMConfigurationKeys
 import org.jetbrains.kotlin.config.JvmTarget
+import org.jetbrains.kotlin.config.LanguageFeature
+import org.jetbrains.kotlin.config.LanguageVersionSettingsImpl
+import org.jetbrains.kotlin.config.ApiVersion
+import org.jetbrains.kotlin.config.LanguageVersion
 import org.jetbrains.kotlin.container.ComponentProvider
 import org.jetbrains.kotlin.container.get
 import org.jetbrains.kotlin.compiler.plugin.ComponentRegistrar
@@ -93,7 +97,17 @@ private class CompilationEnvironment(
             parentDisposable = disposable,
             // Not to be confused with the CompilerConfiguration in the language server Configuration
             configuration = KotlinCompilerConfiguration().apply {
+                val langFeatures = mutableMapOf<LanguageFeature, LanguageFeature.State>()
+                langFeatures[LanguageFeature.MultiPlatformProjects] = LanguageFeature.State.ENABLED
+                val languageVersionSettings = LanguageVersionSettingsImpl(
+                    LanguageVersion.LATEST_STABLE,
+                    ApiVersion.createByLanguageVersion(LanguageVersion.LATEST_STABLE),
+                    emptyMap(),
+                    langFeatures
+                )
+
                 put(CommonConfigurationKeys.MODULE_NAME, JvmProtoBufUtil.DEFAULT_MODULE_NAME)
+                put(CommonConfigurationKeys.LANGUAGE_VERSION_SETTINGS, languageVersionSettings)
                 put(CLIConfigurationKeys.MESSAGE_COLLECTOR_KEY, LoggingMessageCollector)
                 add(ComponentRegistrar.PLUGIN_COMPONENT_REGISTRARS, ScriptingCompilerConfigurationComponentRegistrar())
                 addJvmClasspathRoots(classPath.map { it.toFile() })
