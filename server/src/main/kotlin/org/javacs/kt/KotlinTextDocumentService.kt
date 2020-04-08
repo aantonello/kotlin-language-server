@@ -61,7 +61,7 @@ class KotlinTextDocumentService(
         get() = uri.endsWith(".kts")
 
     private val TextDocumentIdentifier.content: String
-        get() = uriContentProvider.contentOf(parseURI(uri))
+        get() = sp.content(parseURI(uri))
 
     fun connect(client: LanguageClient) {
         this.client = client

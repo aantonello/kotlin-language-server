@@ -1,7 +1,10 @@
 package org.javacs.kt
 
+import org.javacs.kt.util.fileExtension
 import org.javacs.kt.util.filePath
 import org.javacs.kt.util.describeURI
+import org.jetbrains.kotlin.com.intellij.lang.Language
+import org.jetbrains.kotlin.com.intellij.psi.PsiFile
 import org.jetbrains.kotlin.container.ComponentProvider
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.resolve.BindingContext
@@ -29,9 +32,11 @@ class SourcePath(
         var compiledFile: KtFile? = null,
         var compiledContext: BindingContext? = null,
         var compiledContainer: ComponentProvider? = null,
+        val language: Language? = null,
         val isTemporary: Boolean = false // A temporary source file will not be returned by .all()
     ) {
-        val isScript: Boolean = uri.toString().endsWith(".kts")
+        val extension: String? = uri.fileExtension ?: language?.associatedFileType?.defaultExtension
+        val isScript: Boolean = extension == "kts"
         val kind: CompilationKind =
             if (path?.fileName?.toString()?.endsWith(".gradle.kts") ?: false) CompilationKind.BUILD_SCRIPT
             else CompilationKind.DEFAULT
@@ -40,43 +45,55 @@ class SourcePath(
             content = newContent
         }
 
-        fun parseIfChanged(): SourceFile {
-            if (content != parsed?.text) {
-                parsed = cp.compiler.createFile(content, path ?: Paths.get("sourceFile.virtual.kt"), kind)
-            }
-
-            return this
+        fun clean() {
+            parsed = null
+            compiledFile = null
+            compiledContext = null
+            compiledContainer = null
         }
 
-        fun compileIfNull(): SourceFile =
-                parseIfChanged().doCompileIfNull()
+        fun parse() {
+            // TODO: Create PsiFile using the stored language instead
+            parsed = cp.compiler.createKtFile(content, path ?: Paths.get("sourceFile.virtual.$extension"), kind)
+        }
 
-        private fun doCompileIfNull(): SourceFile =
-            if (compiledFile == null)
-                doCompileIfChanged()
-            else
-                this
-
-        fun compileIfChanged(): SourceFile =
-                parseIfChanged().doCompileIfChanged()
-
-        private fun doCompileIfChanged(): SourceFile {
-            if (parsed?.text != compiledFile?.text) {
-                LOG.debug("Compiling {}", path?.fileName)
-
-                val (context, container) = cp.compiler.compileFile(parsed!!, allIncludingThis(), kind)
-                parseDataWriteLock.withLock {
-                    compiledContext = context
-                    compiledContainer = container
-                    compiledFile = parsed
-                }
+        fun parseIfChanged() {
+            if (content != parsed?.text) {
+                parse()
             }
+        }
 
-            return this
+        fun compileIfNull() = parseIfChanged().apply { doCompileIfNull() }
+
+        private fun doCompileIfNull() {
+            if (compiledFile == null) {
+                doCompileIfChanged()
+            }
+        }
+
+        fun compileIfChanged() = parseIfChanged().apply { doCompileIfChanged() }
+
+        fun compile() = parse().apply { doCompile() }
+
+        private fun doCompile() {
+            LOG.debug("Compiling {}", path?.fileName)
+
+            val (context, container) = cp.compiler.compileKtFile(parsed!!, allIncludingThis(), kind)
+            parseDataWriteLock.withLock {
+                compiledContext = context
+                compiledContainer = container
+                compiledFile = parsed
+            }
+        }
+
+        private fun doCompileIfChanged() {
+            if (parsed?.text != compiledFile?.text) {
+                doCompile()
+            }
         }
 
         fun prepareCompiledFile(): CompiledFile =
-                parseIfChanged().compileIfNull().doPrepareCompiledFile()
+                parseIfChanged().apply { compileIfNull() }.let { doPrepareCompiledFile() }
 
         private fun doPrepareCompiledFile(): CompiledFile =
                 CompiledFile(content, compiledFile!!, compiledContext!!, compiledContainer!!, allIncludingThis(), cp, isScript, kind)
@@ -92,12 +109,12 @@ class SourcePath(
             // Fallback solution, usually *all* source files
             // should be added/opened through SourceFiles
             LOG.warn("Requested source file {} is not on source path, this is most likely a bug. Adding it now temporarily...", describeURI(uri))
-            put(uri, contentProvider.contentOf(uri), temporary = true)
+            put(uri, contentProvider.contentOf(uri), null, temporary = true)
         }
         return files[uri]!!
     }
 
-    fun put(uri: URI, content: String, temporary: Boolean = false) {
+    fun put(uri: URI, content: String, language: Language?, temporary: Boolean = false) {
         assert(!content.contains('\r'))
 
         if (temporary) {
@@ -107,7 +124,7 @@ class SourcePath(
         if (uri in files) {
             sourceFile(uri).put(content)
         } else {
-            files[uri] = SourceFile(uri, content, isTemporary = temporary)
+            files[uri] = SourceFile(uri, content, language = language, isTemporary = temporary)
         }
     }
 
@@ -129,13 +146,13 @@ class SourcePath(
      */
     fun content(uri: URI): String = sourceFile(uri).content
 
-    fun parsedFile(uri: URI): KtFile = sourceFile(uri).parseIfChanged().parsed!!
+    fun parsedFile(uri: URI): KtFile = sourceFile(uri).apply { parseIfChanged() }.parsed!!
 
     /**
      * Compile the latest version of a file
      */
     fun currentVersion(uri: URI): CompiledFile =
-            sourceFile(uri).compileIfChanged().prepareCompiledFile()
+            sourceFile(uri).apply { compileIfChanged() }.prepareCompiledFile()
 
     /**
      * Return whatever is the most-recent already-compiled version of `file`
@@ -155,10 +172,10 @@ class SourcePath(
         // Compile changed files
         fun compileAndUpdate(changed: List<SourceFile>, kind: CompilationKind): BindingContext? {
             if (changed.isEmpty()) return null
-            val parse = changed.associateWith { it.parseIfChanged().parsed!! }
+            val parse = changed.associateWith { it.apply { parseIfChanged() }.parsed!! }
             val allFiles = all()
             beforeCompileCallback.invoke()
-            val (context, container) = cp.compiler.compileFiles(parse.values, allFiles, kind)
+            val (context, container) = cp.compiler.compileKtFiles(parse.values, allFiles, kind)
 
             // Update cache
             for ((f, parsed) in parse) {
@@ -186,10 +203,22 @@ class SourcePath(
     }
 
     /**
+     * Recompiles all source files that are initialized.
+     */
+    fun refresh() {
+        val initialized = files.values.any { it.parsed != null }
+        if (initialized) {
+            LOG.info("Refreshing source path")
+            files.values.forEach { it.clean() }
+            files.values.forEach { it.compile() }
+        }
+    }
+
+    /**
      * Get parsed trees for all .kt files on source path
      */
     fun all(includeHidden: Boolean = false): Collection<KtFile> =
             files.values
                 .filter { includeHidden || !it.isTemporary }
-                .map { it.parseIfChanged().parsed!! }
+                .map { it.apply { parseIfChanged() }.parsed!! }
 }

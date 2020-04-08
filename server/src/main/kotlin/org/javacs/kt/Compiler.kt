@@ -1,11 +1,13 @@
 package org.javacs.kt
 
 import org.jetbrains.kotlin.com.intellij.codeInsight.NullableNotNullManager
+import org.jetbrains.kotlin.com.intellij.lang.Language
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.com.intellij.openapi.vfs.StandardFileSystems
 import org.jetbrains.kotlin.com.intellij.openapi.vfs.VirtualFileManager
 import org.jetbrains.kotlin.com.intellij.openapi.vfs.VirtualFileSystem
+import org.jetbrains.kotlin.com.intellij.psi.PsiFile
 import org.jetbrains.kotlin.com.intellij.psi.PsiFileFactory
 import org.jetbrains.kotlin.com.intellij.mock.MockProject
 import org.jetbrains.kotlin.cli.common.CLIConfigurationKeys
@@ -14,6 +16,7 @@ import org.jetbrains.kotlin.cli.jvm.compiler.CliBindingTrace
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.compiler.TopDownAnalyzerFacadeForJVM
+import org.jetbrains.kotlin.cli.jvm.config.addJavaSourceRoots
 import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
 import org.jetbrains.kotlin.cli.jvm.plugins.PluginCliParser
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
@@ -33,7 +36,7 @@ import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.BindingTraceContext
 import org.jetbrains.kotlin.resolve.LazyTopDownAnalyzer
-import org.jetbrains.kotlin.resolve.TopDownAnalysisMode.TopLevelDeclarations
+import org.jetbrains.kotlin.resolve.TopDownAnalysisMode
 import org.jetbrains.kotlin.resolve.calls.components.InferenceSession
 import org.jetbrains.kotlin.resolve.calls.smartcasts.DataFlowInfo
 import org.jetbrains.kotlin.resolve.extensions.ExtraImportsProviderExtension
@@ -84,6 +87,7 @@ private val GRADLE_DSL_DEPENDENCY_PATTERN = Regex("^gradle-(?:kotlin-dsl|core).*
  * files and expressions.
  */
 private class CompilationEnvironment(
+    javaSourcePath: Set<Path>,
     classPath: Set<Path>
 ) : Closeable {
     private val disposable = Disposer.newDisposable()
@@ -110,7 +114,9 @@ private class CompilationEnvironment(
                 put(CommonConfigurationKeys.LANGUAGE_VERSION_SETTINGS, languageVersionSettings)
                 put(CLIConfigurationKeys.MESSAGE_COLLECTOR_KEY, LoggingMessageCollector)
                 add(ComponentRegistrar.PLUGIN_COMPONENT_REGISTRARS, ScriptingCompilerConfigurationComponentRegistrar())
+
                 addJvmClasspathRoots(classPath.map { it.toFile() })
+                addJavaSourceRoots(javaSourcePath.map { it.toFile() })
 
                 // Setup script templates (e.g. used by Gradle's Kotlin DSL)
                 val scriptDefinitions: MutableList<ScriptDefinition> = mutableListOf(ScriptDefinition.getDefault(defaultJvmScriptingHostConfiguration))
@@ -187,13 +193,14 @@ private class CompilationEnvironment(
     fun createContainer(sourcePath: Collection<KtFile>): Pair<ComponentProvider, BindingTraceContext> {
         val trace = CliBindingTrace()
         val container = TopDownAnalyzerFacadeForJVM.createContainer(
-                project = environment.project,
-                files = listOf(),
-                trace = trace,
-                configuration = environment.configuration,
-                packagePartProvider = environment::createPackagePartProvider,
-                // TODO FileBasedDeclarationProviderFactory keeps indices, re-use it across calls
-                declarationProviderFactory = { storageManager, _ ->  FileBasedDeclarationProviderFactory(storageManager, sourcePath) })
+            project = environment.project,
+            files = sourcePath,
+            trace = trace,
+            configuration = environment.configuration,
+            packagePartProvider = environment::createPackagePartProvider,
+            // TODO FileBasedDeclarationProviderFactory keeps indices, re-use it across calls
+            declarationProviderFactory = ::FileBasedDeclarationProviderFactory
+        )
         return Pair(container, trace)
     }
 
@@ -217,12 +224,12 @@ enum class CompilationKind {
  * Incrementally compiles files and expressions.
  * The basic strategy for compiling one file at-a-time is outlined in OneFilePerformance.
  */
-class Compiler(classPath: Set<Path>, buildScriptClassPath: Set<Path> = emptySet()) : Closeable {
+class Compiler(javaSourcePath: Set<Path>, classPath: Set<Path>, buildScriptClassPath: Set<Path> = emptySet()) : Closeable {
     private var closed = false
     private val localFileSystem: VirtualFileSystem
 
-    private val defaultCompileEnvironment = CompilationEnvironment(classPath)
-    private val buildScriptCompileEnvironment = buildScriptClassPath.takeIf { it.isNotEmpty() }?.let(::CompilationEnvironment)
+    private val defaultCompileEnvironment = CompilationEnvironment(javaSourcePath, classPath)
+    private val buildScriptCompileEnvironment = buildScriptClassPath.takeIf { it.isNotEmpty() }?.let { CompilationEnvironment(emptySet(), it) }
     private val compileLock = ReentrantLock() // TODO: Lock at file-level
 
     companion object {
@@ -244,26 +251,25 @@ class Compiler(classPath: Set<Path>, buildScriptClassPath: Set<Path> = emptySet(
         buildScriptCompileEnvironment?.updateConfiguration(config)
     }
 
-    fun createFile(content: String, file: Path = Paths.get("dummy.virtual.kt"), kind: CompilationKind = CompilationKind.DEFAULT): KtFile {
+    fun createPsiFile(content: String, file: Path = Paths.get("dummy.virtual.kt"), language: Language = KotlinLanguage.INSTANCE, kind: CompilationKind = CompilationKind.DEFAULT): PsiFile {
         assert(!content.contains('\r'))
 
-        val new = psiFileFactoryFor(kind).createFileFromText(file.toString(), KotlinLanguage.INSTANCE, content, true, false) as KtFile
+        val new = psiFileFactoryFor(kind).createFileFromText(file.toString(), language, content, true, false)
         assert(new.virtualFile != null)
 
         return new
     }
 
-    fun createExpression(content: String, file: Path = Paths.get("dummy.virtual.kt"), kind: CompilationKind = CompilationKind.DEFAULT): KtExpression {
-        val property = parseDeclaration("val x = $content", file, kind) as KtProperty
+    fun createKtFile(content: String, file: Path = Paths.get("dummy.virtual.kt"), kind: CompilationKind = CompilationKind.DEFAULT): KtFile =
+            createPsiFile(content, file, language = KotlinLanguage.INSTANCE, kind = kind) as KtFile
 
+    fun createKtExpression(content: String, file: Path = Paths.get("dummy.virtual.kt"), kind: CompilationKind = CompilationKind.DEFAULT): KtExpression {
+        val property = createKtDeclaration("val x = $content", file, kind) as KtProperty
         return property.initializer!!
     }
 
-    fun createDeclaration(content: String, file: Path = Paths.get("dummy.virtual.kt"), kind: CompilationKind = CompilationKind.DEFAULT): KtDeclaration =
-            parseDeclaration(content, file, kind)
-
-    private fun parseDeclaration(content: String, file: Path, kind: CompilationKind = CompilationKind.DEFAULT): KtDeclaration {
-        val parse = createFile(content, file, kind)
+    fun createKtDeclaration(content: String, file: Path = Paths.get("dummy.virtual.kt"), kind: CompilationKind = CompilationKind.DEFAULT): KtDeclaration {
+        val parse = createKtFile(content, file, kind)
         val declarations = parse.declarations
 
         assert(declarations.size == 1) { "${declarations.size} declarations in $content" }
@@ -288,25 +294,24 @@ class Compiler(classPath: Set<Path>, buildScriptClassPath: Set<Path> = emptySet(
     fun psiFileFactoryFor(kind: CompilationKind): PsiFileFactory =
         PsiFileFactory.getInstance(compileEnvironmentFor(kind).environment.project)
 
-    fun compileFile(file: KtFile, sourcePath: Collection<KtFile>, kind: CompilationKind = CompilationKind.DEFAULT): Pair<BindingContext, ComponentProvider> =
-        compileFiles(listOf(file), sourcePath, kind)
+    fun compileKtFile(file: KtFile, sourcePath: Collection<KtFile>, kind: CompilationKind = CompilationKind.DEFAULT): Pair<BindingContext, ComponentProvider> =
+        compileKtFiles(listOf(file), sourcePath, kind)
 
-    fun compileFiles(files: Collection<KtFile>, sourcePath: Collection<KtFile>, kind: CompilationKind = CompilationKind.DEFAULT): Pair<BindingContext, ComponentProvider> {
+    fun compileKtFiles(files: Collection<KtFile>, sourcePath: Collection<KtFile>, kind: CompilationKind = CompilationKind.DEFAULT): Pair<BindingContext, ComponentProvider> {
         if (kind == CompilationKind.BUILD_SCRIPT) {
             // Print the (legacy) script template used by the compiled Kotlin DSL build file
             files.forEach { LOG.debug { "$it -> ScriptDefinition: ${it.findScriptDefinition()?.asLegacyOrNull<KotlinScriptDefinition>()?.template?.simpleName}" } }
         }
 
         compileLock.withLock {
-            val (container, trace) = compileEnvironmentFor(kind).createContainer(sourcePath)
-            val topDownAnalyzer = container.get<LazyTopDownAnalyzer>()
-            topDownAnalyzer.analyzeDeclarations(TopLevelDeclarations, files)
-
+            val compileEnv = compileEnvironmentFor(kind)
+            val (container, trace) = compileEnv.createContainer(sourcePath)
+            container.get<LazyTopDownAnalyzer>().analyzeDeclarations(TopDownAnalysisMode.TopLevelDeclarations, files)
             return Pair(trace.bindingContext, container)
         }
     }
 
-    fun compileExpression(expression: KtExpression, scopeWithImports: LexicalScope, sourcePath: Collection<KtFile>, kind: CompilationKind = CompilationKind.DEFAULT): Pair<BindingContext, ComponentProvider> {
+    fun compileKtExpression(expression: KtExpression, scopeWithImports: LexicalScope, sourcePath: Collection<KtFile>, kind: CompilationKind = CompilationKind.DEFAULT): Pair<BindingContext, ComponentProvider> {
         try {
             // Use same lock as 'compileFile' to avoid concurrency issues such as #42
             compileLock.withLock {

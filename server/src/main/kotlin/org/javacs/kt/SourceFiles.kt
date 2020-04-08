@@ -1,6 +1,9 @@
 package org.javacs.kt
 
 import org.jetbrains.kotlin.com.intellij.openapi.util.text.StringUtil.convertLineSeparators
+import org.jetbrains.kotlin.com.intellij.lang.java.JavaLanguage
+import org.jetbrains.kotlin.com.intellij.lang.Language
+import org.jetbrains.kotlin.idea.KotlinLanguage
 import org.eclipse.lsp4j.TextDocumentContentChangeEvent
 import org.javacs.kt.util.KotlinLSException
 import org.javacs.kt.util.filePath
@@ -17,9 +20,8 @@ import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.util.stream.Collectors
 
-private class SourceVersion(val content: String, val version: Int, val isTemporary: Boolean)
+private class SourceVersion(val content: String, val version: Int, val language: Language?, val isTemporary: Boolean)
 
 /**
  * Notify SourcePath whenever a file changes
@@ -33,7 +35,7 @@ private class NotifySourcePath(private val sp: SourcePath) {
         val content = convertLineSeparators(source.content)
 
         files[uri] = source
-        sp.put(uri, content, source.isTemporary)
+        sp.put(uri, content, source.language, source.isTemporary)
     }
 
     fun remove(uri: URI) {
@@ -71,7 +73,7 @@ class SourceFiles(
     private val open = mutableSetOf<URI>()
 
     fun open(uri: URI, content: String, version: Int) {
-        files[uri] = SourceVersion(content, version, isTemporary = !exclusions.isURIIncluded(uri))
+        files[uri] = SourceVersion(content, version, languageOf(uri), isTemporary = !exclusions.isURIIncluded(uri))
         open.add(uri)
     }
 
@@ -107,7 +109,7 @@ class SourceFiles(
                 else newText = patch(newText, change)
             }
 
-            files[uri] = SourceVersion(newText, newVersion, existing.isTemporary)
+            files[uri] = SourceVersion(newText, newVersion, existing.language, existing.isTemporary)
         }
     }
 
@@ -116,19 +118,21 @@ class SourceFiles(
     }
 
     fun deletedOnDisk(uri: URI) {
-        if (isSource(uri))
+        if (isSource(uri)) {
             files.remove(uri)
+        }
     }
 
     fun changedOnDisk(uri: URI) {
-        if (isSource(uri))
+        if (isSource(uri)) {
             files[uri] = readFromDisk(uri, files[uri]?.isTemporary ?: true)
                 ?: throw KotlinLSException("Could not read source file '$uri' after being changed on disk")
+        }
     }
 
     private fun readFromDisk(uri: URI, temporary: Boolean): SourceVersion? = try {
         val content = contentProvider.contentOf(uri)
-        SourceVersion(content, -1, isTemporary = temporary)
+        SourceVersion(content, -1, languageOf(uri), isTemporary = temporary)
     } catch (e: FileNotFoundException) {
         null
     } catch (e: IOException) {
@@ -136,9 +140,14 @@ class SourceFiles(
         null
     }
 
-    private fun isSource(uri: URI): Boolean {
-        val path = uri.path
-        return (path.endsWith(".kt") || path.endsWith(".kts")) && exclusions.isURIIncluded(uri)
+    private fun isSource(uri: URI): Boolean = exclusions.isURIIncluded(uri) && languageOf(uri) != null
+
+    private fun languageOf(uri: URI): Language? {
+        val fileName = uri.filePath?.fileName?.toString() ?: return null
+        return when {
+            fileName.endsWith(".kt") || fileName.endsWith(".kts") -> KotlinLanguage.INSTANCE
+            else -> null
+        }
     }
 
     fun addWorkspaceRoot(root: Path) {
@@ -146,10 +155,10 @@ class SourceFiles(
 
         logAdded(addSources, root)
 
-        for (file in addSources) {
-            readFromDisk(file.toUri(), temporary = false)?.let {
-                files[file.toUri()] = it
-            } ?: LOG.warn("Could not read source file '{}'", file)
+        for (uri in addSources) {
+            readFromDisk(uri, temporary = false)?.let {
+                files[uri] = it
+            } ?: LOG.warn("Could not read source file '{}'", uri.path)
         }
 
         workspaceRoots.add(root)
@@ -159,7 +168,7 @@ class SourceFiles(
     fun removeWorkspaceRoot(root: Path) {
         val rmSources = files.keys.filter { it.filePath?.startsWith(root) ?: false }
 
-        logRemoved(rmSources.map(Paths::get), root)
+        logRemoved(rmSources, root)
 
         files.removeAll(rmSources)
         workspaceRoots.remove(root)
@@ -205,18 +214,19 @@ private fun patch(sourceText: String, change: TextDocumentContentChangeEvent): S
     }
 }
 
-private fun findSourceFiles(root: Path): Set<Path> {
-    val pattern = FileSystems.getDefault().getPathMatcher("glob:*.{kt,kts}")
-    val exclusions = SourceExclusions(root)
-    return Files.walk(root)
-            .filter { pattern.matches(it.fileName) && exclusions.isPathIncluded(it) }
-            .collect(Collectors.toSet())
+private fun findSourceFiles(root: Path): Set<URI> {
+    val sourceMatcher = FileSystems.getDefault().getPathMatcher("glob:*.{kt,kts}")
+    return SourceExclusions(root)
+        .walkIncluded()
+        .filter { sourceMatcher.matches(it.fileName) }
+        .map(Path::toUri)
+        .toSet()
 }
 
-private fun logAdded(sources: Collection<Path>, rootPath: Path?) {
-    LOG.info("Adding {} under {} to source path", describeURIs(sources.map(Path::toUri)), rootPath)
+private fun logAdded(sources: Collection<URI>, rootPath: Path?) {
+    LOG.info("Adding {} under {} to source path", describeURIs(sources), rootPath)
 }
 
-private fun logRemoved(sources: Collection<Path>, rootPath: Path?) {
-    LOG.info("Removing {} under {} to source path", describeURIs(sources.map(Path::toUri)), rootPath)
+private fun logRemoved(sources: Collection<URI>, rootPath: Path?) {
+    LOG.info("Removing {} under {} to source path", describeURIs(sources), rootPath)
 }
