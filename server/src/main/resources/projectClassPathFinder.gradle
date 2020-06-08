@@ -17,18 +17,10 @@ allprojects { project ->
 						def userClasses = project.getBuildDir().absolutePath +
 							File.separator + "intermediates" +
 							File.separator + "javac" +
-							File.separator + variant.baseName.replaceAll("-", File.separator) +
-							File.separator + "classes"
-
-						System.out.println "kotlin-lsp-gradle $userClasses"
-
-						def userVariantClasses = project.getBuildDir().absolutePath +
-							File.separator + "intermediates" +
-							File.separator + "javac" +
 							File.separator + variantBase +
 							File.separator + "classes"
 
-						System.out.println "kotlin-lsp-gradle $userVariantClasses"
+						System.out.println "kotlin-lsp-gradle $userClasses"
 
 						variant.getCompileClasspath().each {
 							System.out.println "kotlin-lsp-gradle $it"

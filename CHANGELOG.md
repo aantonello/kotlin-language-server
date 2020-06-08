@@ -3,6 +3,9 @@ All notable changes to the language server will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.6.1]
+- Adjust `projectClassPathFinder.gradle` to find generated classes for Android projects.
+
 ## [0.6.0]
 - Add package completion
 - Support Java imports

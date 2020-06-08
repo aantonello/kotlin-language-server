@@ -6,6 +6,7 @@
 
 .idea
 *.iml
+.*.sw?
 
 lib-kotlin
 bin
